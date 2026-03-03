@@ -212,7 +212,7 @@ function makeProxy(sessionId = null, country = null) {
 
   try {
     const proxyHost = new URL(apiUrl).hostname;
-    const proxyPort = process.env.CN_PROXY_PORT || '8080';
+    const proxyPort = process.env.CN_PROXY_PORT || '8088';
     const proxyConfig = {
       server:   `http://${proxyHost}:${proxyPort}`,
       username: `${creds.agentId}|${cty}`,  // forward proxy splits on '|' to get country

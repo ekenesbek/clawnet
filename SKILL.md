@@ -21,60 +21,72 @@ Use this skill whenever the agent needs to:
 
 ## Observation — how to read the page
 
-**ALWAYS use `snapshot()` instead of `page.textContent()`.** The snapshot returns a compact accessibility tree (2-5K tokens) instead of raw page text (50-100K tokens). This gives you structured, semantic understanding of the page — you can see what's a button, what's a text field, whether a form is filled or empty, and what you can interact with.
+**ALWAYS use `snapshotAI()` instead of `page.textContent()` or `evaluate()`.** It returns a structured accessibility tree with embedded `[ref=eN]` annotations. You can then click/fill/type by ref — no CSS selectors needed.
 
-### Reading the page
+### Reading the page (preferred: snapshotAI + refs)
 
 ```javascript
-// BAD — dumps ALL text as a flat wall of text, 50-100K tokens, no structure
+// BAD — dumps ALL text, 50-100K tokens, no structure, no refs
 const text = await page.textContent('body');
 
-// GOOD — compact accessibility tree, 2-5K tokens, structured
-const tree = await snapshot();
+// BAD — brittle regex on raw DOM, breaks when HTML changes
+await page.evaluate(() => document.querySelector('button').click());
 
-// BETTER — only interactive elements (buttons, inputs, links), 0.5-2K tokens
-const interactive = await snapshot({ interactiveOnly: true });
+// GOOD — AI-optimized snapshot with clickable refs
+const { snapshot } = await browser.snapshotAI();
+// Returns:
+//   - navigation "Main" [ref=e1]:
+//     - link "Home" [ref=e2]
+//   - heading "Welcome" [ref=e3]
+//   - textbox "Email" [ref=e4]
+//   - textbox "Password" [ref=e5]
+//   - button "Sign in" [ref=e6]
 
-// BEST — scoped to a specific region
-const formTree = await snapshot({ selector: 'form' });
-const mainContent = await snapshot({ selector: 'main' });
+// Then interact by ref:
+await browser.fillRef('e4', 'user@example.com');
+await browser.fillRef('e5', 'secret');
+await browser.clickRef('e6');
 ```
 
-The snapshot output looks like:
-```yaml
-- navigation "Main":
-  - list:
-    - listitem:
-      - link "Home"
-- main:
-  - heading "Welcome" [level=1]
-  - textbox "Email" value=""
-  - textbox "Password"
-  - button "Sign in"
-```
+### Alternative: snapshot() (YAML without refs)
 
-This tells you exactly what's on the page, what state it's in, and what you can interact with.
+```javascript
+// Compact accessibility tree without refs — use when you don't need to interact
+const tree = await browser.snapshot();
+const interactive = await browser.snapshot({ interactiveOnly: true });
+const formTree = await browser.snapshot({ selector: 'form' });
+```
 
 ### Observation workflow
 
 Before every action, follow this sequence:
 
-1. **Quick scan** — `await snapshot({ interactiveOnly: true })` to see what you can interact with
-2. **Read content** — `await snapshot({ selector: 'main' })` if you need to understand page structure
-3. **Read text** — `await extractText()` if you need clean readable text (menus, prices, articles)
-4. **Visual check** — `await takeScreenshot()` only if you need to see colors, layout, maps, or images
-5. **Act** — use semantic locators (see below), or `batchActions()` for multi-step flows
+1. **Snapshot** — `const { snapshot } = await browser.snapshotAI()` to see the page with refs
+2. **Read text** — `await browser.extractText()` if you need clean readable text (menus, prices, articles)
+3. **Visual check** — `await browser.takeScreenshot()` only if you need to see colors, layout, maps, or images
+4. **Act by ref** — `await browser.clickRef('e4')`, `await browser.fillRef('e5', 'text')` etc.
+5. **Verify** — `await browser.snapshotAI()` again to confirm the action worked
+6. **Batch** — use `batchActions()` for multi-step flows
 
-### Targeting elements — use semantic locators
+### Targeting elements — use refs from snapshotAI()
 
-**PREFER semantic locators over CSS selectors.** They're more resilient and match how the accessibility tree describes elements.
+**ALWAYS use refs from `snapshotAI()` output. NEVER use CSS selectors or evaluate() with regex.**
 
 ```javascript
 // BAD — brittle CSS selectors that break when HTML changes
 await page.click('#login_field');
 await page.fill('input[name="email"]', 'user@example.com');
 
-// GOOD — semantic locators that match the snapshot output
+// BAD — regex on raw DOM, blind guessing
+await page.evaluate(() => document.querySelectorAll('button').find(b => /sign in/i.test(b.innerText))?.click());
+
+// GOOD — ref-based from snapshotAI() output
+const { snapshot } = await browser.snapshotAI();
+// snapshot shows: textbox "Email" [ref=e4], button "Sign in" [ref=e6]
+await browser.fillRef('e4', 'user@example.com');
+await browser.clickRef('e6');
+
+// ALSO GOOD — semantic locators (when you know the label)
 await page.getByLabel('Email').fill('user@example.com');
 await page.getByLabel('Password').fill('secret');
 await page.getByRole('button', { name: 'Sign in' }).click();
@@ -340,7 +352,7 @@ Launch a stealth Chromium browser with residential proxy.
 | `logLevel` | string | `'actions'` | `'off'` \| `'actions'` \| `'verbose'`. Env: `CN_LOG_LEVEL` |
 | `task` | string | `null` | User's prompt / task description. Recorded in the session log for context. |
 
-Returns: `{ browser, ctx, page, logger, humanClick, humanMouseMove, humanType, humanScroll, humanRead, solveCaptcha, takeScreenshot, screenshotAndReport, snapshot, dumpInteractiveElements, extractText, getCookies, setCookies, clearCookies, batchActions, sleep, rand, getSessionLog }`
+Returns: `{ browser, ctx, page, logger, humanClick, humanMouseMove, humanType, humanScroll, humanRead, solveCaptcha, takeScreenshot, screenshotAndReport, snapshot, snapshotAI, dumpInteractiveElements, clickRef, fillRef, typeRef, selectRef, hoverRef, extractText, getCookies, setCookies, clearCookies, batchActions, sleep, rand, getSessionLog }`
 
 ### `solveCaptcha(page, opts)`
 
@@ -387,6 +399,56 @@ Capture a compact accessibility tree of the page. Returns YAML string.
 | `timeout` | number | `5000` | Playwright timeout in ms |
 
 Returns: `string` (YAML accessibility tree)
+
+### `snapshotAI(opts)` — AI-optimized snapshot with refs ⭐ PREFERRED
+
+Returns a structured accessibility tree with embedded `[ref=eN]` annotations. Use this as the primary way to read pages.
+
+```javascript
+const { snapshot, refs, truncated } = await browser.snapshotAI();
+// snapshot: "- heading \"Welcome\" [ref=e1]\n- textbox \"Email\" [ref=e2]\n- button \"Sign in\" [ref=e3]"
+// refs: { e1: true, e2: true, e3: true }
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `maxChars` | number | `20000` | Truncate snapshot to N characters |
+| `timeout` | number | `5000` | Playwright timeout in ms |
+
+Returns: `{ snapshot: string, refs: Object, truncated?: boolean }`
+
+### `clickRef(ref, opts)` — Click element by ref
+
+```javascript
+await browser.clickRef('e3');                          // left click
+await browser.clickRef('e3', { doubleClick: true });   // double click
+```
+
+### `fillRef(ref, value, opts)` — Fill input by ref
+
+```javascript
+await browser.fillRef('e2', 'user@example.com');
+```
+
+### `typeRef(ref, text, opts)` — Type text by ref
+
+```javascript
+await browser.typeRef('e2', 'hello');                          // instant fill
+await browser.typeRef('e2', 'hello', { slowly: true });        // human-like typing
+await browser.typeRef('e2', 'hello', { submit: true });        // type + Enter
+```
+
+### `selectRef(ref, value, opts)` — Select option by ref
+
+```javascript
+await browser.selectRef('e5', 'US');
+```
+
+### `hoverRef(ref, opts)` — Hover element by ref
+
+```javascript
+await browser.hoverRef('e1');  // reveal tooltip/dropdown
+```
 
 ### `extractText(opts)` (from launchBrowser return) / `extractText(page, opts)`
 

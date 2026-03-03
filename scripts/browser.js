@@ -864,6 +864,29 @@ async function batchActions(page, actions, opts = {}) {
         case 'snapshot':
           result = { snapshot: await snapshot(page, act.options || {}) };
           break;
+        case 'snapshotAI':
+          result = await snapshotAI(page, act.options || act);
+          break;
+        case 'clickRef':
+          await clickRef(page, act.ref, act);
+          result = { clicked: act.ref };
+          break;
+        case 'fillRef':
+          await fillRef(page, act.ref, act.value, act);
+          result = { filled: act.ref };
+          break;
+        case 'typeRef':
+          await typeRef(page, act.ref, act.text, act);
+          result = { typed: act.ref };
+          break;
+        case 'selectRef':
+          await selectRef(page, act.ref, act.value, act);
+          result = { selected: act.ref };
+          break;
+        case 'hoverRef':
+          await hoverRef(page, act.ref, act);
+          result = { hovered: act.ref };
+          break;
         default:
           throw new Error('Unknown action: ' + act.action);
       }
@@ -1362,7 +1385,15 @@ function buildResult(browser, ctx, page, logger) {
 
     // Observation layer — use these instead of page.textContent()
     snapshot:               wrappedSnapshot,
+    snapshotAI:             wrap('snapshotAI', (opts) => snapshotAI(rawPage, opts)),
     dumpInteractiveElements: wrappedDumpInteractive,
+
+    // Ref-based interactions — use refs from snapshotAI() output
+    clickRef:       wrap('clickRef', (ref, opts) => clickRef(rawPage, ref, opts)),
+    fillRef:        wrap('fillRef', (ref, value, opts) => fillRef(rawPage, ref, value, opts)),
+    typeRef:        wrap('typeRef', (ref, text, opts) => typeRef(rawPage, ref, text, opts)),
+    selectRef:      wrap('selectRef', (ref, value, opts) => selectRef(rawPage, ref, value, opts)),
+    hoverRef:       wrap('hoverRef', (ref, opts) => hoverRef(rawPage, ref, opts)),
 
     // Text extraction — clean readable text from pages
     extractText:    wrap('extractText', (opts) => extractText(rawPage, opts)),
@@ -1736,6 +1767,162 @@ async function snapshot(page, opts = {}) {
   return yaml;
 }
 
+// ─── AI SNAPSHOT (with refs) ────────────────────────────────────────────────
+// Uses Playwright's _snapshotForAI() (available in 1.58+) which returns a
+// structured accessibility tree with embedded [ref=eN] annotations.
+// Agents can then click/fill/type by ref instead of guessing CSS selectors.
+//
+// Example output:
+//   - navigation "Main" [ref=e1]:
+//     - link "Home" [ref=e2]
+//   - heading "Nike Air Jordan 1 Low" [ref=e3]
+//   - list "Sizes" [ref=e4]:
+//     - button "7" [ref=e5]
+//     - button "8" [ref=e6]
+//   - button "Add to Bag" [ref=e7]
+
+/**
+ * Capture an AI-optimized snapshot of the page with embedded element refs.
+ *
+ * Returns `{ snapshot, refs, truncated }` where `snapshot` is a formatted
+ * string and `refs` is a set of available ref IDs (e.g. "e1", "e2").
+ *
+ * Falls back to ariaSnapshot() if _snapshotForAI is unavailable.
+ *
+ * @param {import('playwright').Page} page
+ * @param {Object} [opts]
+ * @param {number} [opts.maxChars=20000] — Truncate snapshot to N characters
+ * @param {number} [opts.timeout=5000]   — Playwright timeout in ms
+ * @returns {Promise<{snapshot: string, refs: Object<string, boolean>, truncated?: boolean}>}
+ */
+async function snapshotAI(page, opts = {}) {
+  const { maxChars = 20000, timeout = 5000 } = opts;
+
+  // _snapshotForAI is a private Playwright API (available in 1.58+)
+  if (!page._snapshotForAI) {
+    // Fallback to ariaSnapshot if not available
+    const yaml = await snapshot(page, { maxLength: maxChars, timeout });
+    return { snapshot: yaml, refs: {} };
+  }
+
+  const result = await page._snapshotForAI({
+    timeout: Math.max(500, Math.min(60000, timeout)),
+    track: 'response',
+  });
+
+  let snap = String(result?.full ?? '');
+  let truncated = false;
+
+  if (maxChars && snap.length > maxChars) {
+    snap = snap.slice(0, maxChars) + '\n\n[...TRUNCATED - page too large]';
+    truncated = true;
+  }
+
+  // Parse ref IDs from snapshot text: [ref=eN]
+  const refs = {};
+  const refRegex = /\[ref=(e\d+)\]/g;
+  let m;
+  while ((m = refRegex.exec(snap)) !== null) {
+    refs[m[1]] = true;
+  }
+
+  return { snapshot: snap, refs, truncated: truncated || undefined };
+}
+
+// ─── REF-BASED INTERACTIONS ─────────────────────────────────────────────────
+// Click, fill, and type using [ref=eN] from snapshotAI() output.
+// Uses Playwright's aria-ref locator which resolves refs from the last
+// _snapshotForAI() call automatically.
+
+/**
+ * Click an element by its ref ID from a previous snapshotAI() call.
+ *
+ * @param {import('playwright').Page} page
+ * @param {string} ref — Ref ID (e.g. "e4") from snapshotAI() output
+ * @param {Object} [opts]
+ * @param {number} [opts.timeout=8000]
+ * @param {'left'|'right'|'middle'} [opts.button='left']
+ * @param {boolean} [opts.doubleClick=false]
+ */
+async function clickRef(page, ref, opts = {}) {
+  const { timeout = 8000, button = 'left', doubleClick = false } = opts;
+  const locator = page.locator(`aria-ref=${ref}`);
+  if (doubleClick) {
+    await locator.dblclick({ timeout, button });
+  } else {
+    await locator.click({ timeout, button });
+  }
+}
+
+/**
+ * Fill an input/textarea by its ref ID. Clears existing value first.
+ *
+ * @param {import('playwright').Page} page
+ * @param {string} ref — Ref ID from snapshotAI()
+ * @param {string} value — Value to fill
+ * @param {Object} [opts]
+ * @param {number} [opts.timeout=8000]
+ */
+async function fillRef(page, ref, value, opts = {}) {
+  const { timeout = 8000 } = opts;
+  const locator = page.locator(`aria-ref=${ref}`);
+  await locator.fill(value, { timeout });
+}
+
+/**
+ * Type text into an element by ref ID. Supports human-like slow typing.
+ *
+ * @param {import('playwright').Page} page
+ * @param {string} ref — Ref ID from snapshotAI()
+ * @param {string} text — Text to type
+ * @param {Object} [opts]
+ * @param {boolean} [opts.slowly=false] — Type character-by-character with delay
+ * @param {boolean} [opts.submit=false] — Press Enter after typing
+ * @param {number} [opts.timeout=8000]
+ */
+async function typeRef(page, ref, text, opts = {}) {
+  const { slowly = false, submit = false, timeout = 8000 } = opts;
+  const locator = page.locator(`aria-ref=${ref}`);
+  if (slowly) {
+    await locator.click({ timeout });
+    await locator.type(text, { timeout, delay: 75 });
+  } else {
+    await locator.fill(text, { timeout });
+  }
+  if (submit) {
+    await locator.press('Enter', { timeout });
+  }
+}
+
+/**
+ * Select an option in a <select> element by ref ID.
+ *
+ * @param {import('playwright').Page} page
+ * @param {string} ref — Ref ID from snapshotAI()
+ * @param {string} value — Option value or visible text
+ * @param {Object} [opts]
+ * @param {number} [opts.timeout=8000]
+ */
+async function selectRef(page, ref, value, opts = {}) {
+  const { timeout = 8000 } = opts;
+  const locator = page.locator(`aria-ref=${ref}`);
+  await locator.selectOption(value, { timeout });
+}
+
+/**
+ * Hover over an element by ref ID (useful for revealing tooltips/menus).
+ *
+ * @param {import('playwright').Page} page
+ * @param {string} ref — Ref ID from snapshotAI()
+ * @param {Object} [opts]
+ * @param {number} [opts.timeout=8000]
+ */
+async function hoverRef(page, ref, opts = {}) {
+  const { timeout = 8000 } = opts;
+  const locator = page.locator(`aria-ref=${ref}`);
+  await locator.hover({ timeout });
+}
+
 // ─── TEXT EXTRACTION ────────────────────────────────────────────────────────
 // Inspired by PinchTab's /text endpoint (internal/handlers/text.go).
 // Extracts clean readable text from pages, stripping navigation/ads/noise.
@@ -1912,7 +2099,10 @@ module.exports = {
   takeScreenshot, screenshotAndReport,
 
   // Observation layer (accessibility tree)
-  snapshot, dumpInteractiveElements,
+  snapshot, snapshotAI, dumpInteractiveElements,
+
+  // Ref-based interactions (use with snapshotAI)
+  clickRef, fillRef, typeRef, selectRef, hoverRef,
 
   // Text extraction (readability)
   extractText,

@@ -1,6 +1,8 @@
-# Clawnet
+<p align="center">
+  <img src="assets/clawnet-logo.png" width="360" height="360" alt="Clawnet" />
+</p>
 
-Stealth Chromium for AI agents. One install — anti-detection, residential proxies, CAPTCHA solving, human behavior.
+<p>Stealth Chromium for AI agents. One install — anti-detection, residential proxies, CAPTCHA solving, human behavior.</p>
 
 ## The problem
 

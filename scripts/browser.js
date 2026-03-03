@@ -200,6 +200,7 @@ function makeProxy(sessionId = null, country = null) {
 
   if (!_proxyAllowed) {
     // Trial expired or getCredentials() hasn't been called yet / returned sessionGranted=false
+    console.warn('[clawnet:proxy] _proxyAllowed=false → no managed proxy (trial expired or getCredentials not called)');
     return null;
   }
 
@@ -212,11 +213,13 @@ function makeProxy(sessionId = null, country = null) {
   try {
     const proxyHost = new URL(apiUrl).hostname;
     const proxyPort = process.env.CN_PROXY_PORT || '8080';
-    return {
+    const proxyConfig = {
       server:   `http://${proxyHost}:${proxyPort}`,
       username: `${creds.agentId}|${cty}`,  // forward proxy splits on '|' to get country
       password: creds.agentSecret,
     };
+    console.log(`[clawnet:proxy] managed proxy → ${proxyConfig.server}  user=${creds.agentId.slice(0,8)}…|${cty}  secret=${creds.agentSecret.slice(0,6)}…`);
+    return proxyConfig;
   } catch (_) {
     console.warn('[clawnet] Could not parse CN_API_URL for managed proxy host.');
     return null;
@@ -501,7 +504,7 @@ async function autoRegisterAgent(apiUrl) {
   const agentSecret = _crypto.randomBytes(32).toString('base64url');
   const recoveryCode = _crypto.randomBytes(24).toString('base64url');
 
-  console.log('[clawnet] First run — registering new agent...');
+  console.log(`[clawnet:reg] First run — registering agent ${agentId.slice(0,8)}… at ${apiUrl}`);
 
   try {
     const resp = await fetch(`${apiUrl.replace(/\/$/, '')}/agents/register`, {
@@ -513,12 +516,12 @@ async function autoRegisterAgent(apiUrl) {
 
     if (!resp.ok) {
       const text = await resp.text().catch(() => '');
-      console.warn(`[clawnet] Auto-registration failed (HTTP ${resp.status}): ${text}`);
+      console.warn(`[clawnet:reg] Registration failed (HTTP ${resp.status}): ${text}`);
       return null;
     }
 
     const data = await resp.json();
-    console.log(`[clawnet] Agent registered. Trial: ${data.trialLimit ?? 1} free session(s).`);
+    console.log(`[clawnet:reg] Agent registered OK → created=${data.created}, status=${data.status}, trial=${data.trialLimit ?? 1}`);
   } catch (err) {
     console.warn(`[clawnet] Auto-registration failed: ${err.message}`);
     return null;
@@ -628,11 +631,12 @@ async function getCredentials() {
 
     if (!resp.ok) {
       const text = await resp.text().catch(() => '');
-      console.warn(`[clawnet] Credentials API returned ${resp.status}: ${text}`);
+      console.warn(`[clawnet:creds] API ${resp.status}: ${text}`);
       return { ok: false, reason: 'api_error', status: resp.status };
     }
 
     const data = await resp.json();
+    console.log(`[clawnet:creds] API OK → sessionGranted=${data.sessionGranted}, rotate=${!!(data.newAgentSecret)}, trialRemainingMs=${data.trialRemainingMs ?? 'n/a'}, subscriptionActive=${data.subscriptionActive ?? 'n/a'}`);
 
     // Handle secret rotation: server rotates the secret on every /credentials call.
     // Save the new secret to disk and update process env so that makeProxy() uses it.
@@ -651,8 +655,9 @@ async function getCredentials() {
       try {
         _fs.mkdirSync(_path.dirname(CREDENTIALS_FILE), { recursive: true, mode: 0o700 });
         _fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(rotatedCreds, null, 2), { mode: 0o600 });
-      } catch (_) {
-        // Best effort — if save fails, the previous secret still works for one more rotation
+        console.log(`[clawnet:creds] Secret rotated → saved to ${CREDENTIALS_FILE}  newSecret=${data.newAgentSecret.slice(0,6)}…`);
+      } catch (saveErr) {
+        console.error(`[clawnet:creds] ⚠ Secret rotated but FAILED to save: ${saveErr.message} — next launch will use stale secret!`);
       }
 
       // Update process env so makeProxy() picks up the new secret

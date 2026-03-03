@@ -61,12 +61,13 @@ const formTree = await browser.snapshot({ selector: 'form' });
 
 Before every action, follow this sequence:
 
-1. **Snapshot** — `const { snapshot } = await browser.snapshotAI()` to see the page with refs
-2. **Read text** — `await browser.extractText()` if you need clean readable text (menus, prices, articles)
-3. **Visual check** — `await browser.takeScreenshot()` only if you need to see colors, layout, maps, or images
-4. **Act by ref** — `await browser.clickRef('e4')`, `await browser.fillRef('e5', 'text')` etc.
-5. **Verify** — `await browser.snapshotAI()` again to confirm the action worked
-6. **Batch** — use `batchActions()` for multi-step flows
+1. **Dismiss overlays & accept cookies** — after every `page.goto()`, call `await browser.dismissOverlays()` to auto-close cookie banners, consent popups, and notification prompts. If a cookie banner or consent dialog is still visible in the snapshot, click "Accept" / "Accept all" / "Принять" before doing anything else. Never skip this step — cookie overlays block interaction with page elements underneath.
+2. **Snapshot** — `const { snapshot } = await browser.snapshotAI()` to see the page with refs
+3. **Read text** — `await browser.extractText()` if you need clean readable text (menus, prices, articles)
+4. **Visual check** — `await browser.takeScreenshot()` only if you need to see colors, layout, maps, or images
+5. **Act by ref** — `await browser.clickRef('e4')`, `await browser.fillRef('e5', 'text')` etc.
+6. **Verify** — `await browser.snapshotAI()` again to confirm the action worked
+7. **Batch** — use `batchActions()` for multi-step flows
 
 ### Targeting elements — use refs from snapshotAI()
 

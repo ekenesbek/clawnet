@@ -484,12 +484,13 @@ function resolveAgentToken() {
  * @returns {{ agentId, agentSecret, recoveryCode } | null}
  */
 async function autoRegisterAgent(apiUrl) {
-  // Security: if credentials file or directory already exists, an agent was
-  // previously registered. Refuse to generate new ones — the user must either
-  // provide existing credentials via importCredentials() / env vars, or
-  // re-run postinstall interactively.
-  const credentialsDir = _path.dirname(CREDENTIALS_FILE);
-  if (_fs.existsSync(CREDENTIALS_FILE) || _fs.existsSync(credentialsDir)) {
+  // Security: if the credentials FILE already exists, an agent was previously
+  // registered. Refuse to generate new ones — the user must either provide
+  // existing credentials via importCredentials() / env vars, or re-run
+  // postinstall interactively.
+  // NOTE: We check only the file, not the directory — ~/.clawnet/ may exist
+  // from logs or other data without valid credentials being present.
+  if (_fs.existsSync(CREDENTIALS_FILE)) {
     console.error('[clawnet] Agent account already exists.');
     console.error('  Cannot generate new credentials — use importCredentials() to');
     console.error('  provide your existing agentId and agentSecret instead.');

@@ -74,6 +74,8 @@ function _addTab(page, label = '') {
   const tabId = _genTabId();
   _tabs.set(tabId, { page, createdAt: Date.now(), label });
   _activeTabId = tabId;
+  // Attach console/error/network listeners for per-page state tracking
+  try { require('./browser').ensurePageState(page); } catch (_) {}
   // Clean up when page closes
   page.once('close', () => {
     _tabs.delete(tabId);
@@ -307,9 +309,9 @@ async function handleSnapshot(body) {
 
 async function handleSnapshotAI(body) {
   const page = _resolveTabPage(body.tabId);
-  const { maxChars = 20000, timeout = 5000 } = body;
+  const { maxChars = 20000, timeout = 5000, interactiveOnly, compact, maxDepth } = body;
   const browserLib = require('./browser');
-  const result = await browserLib.snapshotAI(page, { maxChars, timeout });
+  const result = await browserLib.snapshotAI(page, { maxChars, timeout, interactiveOnly, compact, maxDepth });
   return { ok: true, tabId: body.tabId || _activeTabId, ...result };
 }
 
@@ -358,11 +360,65 @@ async function handleHoverRef(body) {
   return { ok: true };
 }
 
+async function handleScrollDown(body) {
+  const page = _resolveTabPage(body.tabId);
+  const browserLib = require('./browser');
+  await browserLib.scrollDown(page, { pixels: body.pixels });
+  return { ok: true, tabId: body.tabId || _activeTabId };
+}
+
+async function handleScrollUp(body) {
+  const page = _resolveTabPage(body.tabId);
+  const browserLib = require('./browser');
+  await browserLib.scrollUp(page, { pixels: body.pixels });
+  return { ok: true, tabId: body.tabId || _activeTabId };
+}
+
+async function handleDismissOverlays(body) {
+  const page = _resolveTabPage(body.tabId);
+  const browserLib = require('./browser');
+  const result = await browserLib.dismissOverlays(page);
+  return { ok: true, tabId: body.tabId || _activeTabId, ...result };
+}
+
 async function handleScreenshot(body) {
   const page = _resolveTabPage(body.tabId);
   const { fullPage = false } = body;
   const buf = await page.screenshot({ type: 'png', fullPage });
   return { ok: true, tabId: body.tabId || _activeTabId, base64: buf.toString('base64') };
+}
+
+async function handleScreenshotWithLabels(body) {
+  const page = _resolveTabPage(body.tabId);
+  const { refs, fullPage = false } = body;
+  if (!refs || typeof refs !== 'object') return { error: 'refs object required' };
+  const browserLib = require('./browser');
+  const result = await browserLib.takeScreenshotWithLabels(page, refs, { fullPage });
+  return { ok: true, tabId: body.tabId || _activeTabId, ...result };
+}
+
+async function handleConsoleMessages(body) {
+  const page = _resolveTabPage(body.tabId);
+  const { type, last, pattern } = body;
+  const browserLib = require('./browser');
+  const result = browserLib.getConsoleMessages(page, { type, last, pattern });
+  return { ok: true, tabId: body.tabId || _activeTabId, ...result };
+}
+
+async function handlePageErrors(body) {
+  const page = _resolveTabPage(body.tabId);
+  const { last } = body;
+  const browserLib = require('./browser');
+  const result = browserLib.getPageErrors(page, { last });
+  return { ok: true, tabId: body.tabId || _activeTabId, ...result };
+}
+
+async function handleNetworkRequests(body) {
+  const page = _resolveTabPage(body.tabId);
+  const { last, urlPattern, method, failedOnly } = body;
+  const browserLib = require('./browser');
+  const result = browserLib.getNetworkRequests(page, { last, urlPattern, method, failedOnly });
+  return { ok: true, tabId: body.tabId || _activeTabId, ...result };
 }
 
 async function handleExtractText(body) {
@@ -457,7 +513,14 @@ const ROUTES = {
   '/typeRef':      handleTypeRef,
   '/selectRef':    handleSelectRef,
   '/hoverRef':     handleHoverRef,
+  '/scrollDown':   handleScrollDown,
+  '/scrollUp':     handleScrollUp,
+  '/dismissOverlays': handleDismissOverlays,
   '/screenshot':   handleScreenshot,
+  '/screenshotWithLabels': handleScreenshotWithLabels,
+  '/consoleMessages': handleConsoleMessages,
+  '/pageErrors':   handlePageErrors,
+  '/networkRequests': handleNetworkRequests,
   '/extractText':  handleExtractText,
   '/batchActions': handleBatchActions,
   '/eval':         handleEval,

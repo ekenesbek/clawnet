@@ -33,14 +33,15 @@ const text = await page.textContent('body');
 await page.evaluate(() => document.querySelector('button').click());
 
 // GOOD — AI-optimized snapshot with clickable refs
-const { snapshot } = await browser.snapshotAI();
-// Returns:
+const { snapshot, refs } = await browser.snapshotAI();
+// snapshot shows:
 //   - navigation "Main" [ref=e1]:
 //     - link "Home" [ref=e2]
 //   - heading "Welcome" [ref=e3]
 //   - textbox "Email" [ref=e4]
 //   - textbox "Password" [ref=e5]
 //   - button "Sign in" [ref=e6]
+// refs: { e1: { role: 'navigation', name: 'Main' }, ..., e6: { role: 'button', name: 'Sign in' } }
 
 // Then interact by ref:
 await browser.fillRef('e4', 'user@example.com');
@@ -57,20 +58,94 @@ const interactive = await browser.snapshot({ interactiveOnly: true });
 const formTree = await browser.snapshot({ selector: 'form' });
 ```
 
-### Observation workflow
+### Observation workflow — the core loop
 
-**IMPORTANT: Always `page.goto(url)` BEFORE calling `snapshotAI()`.** Snapshot on `about:blank` returns nothing. Navigate first, then observe.
+The agent works in a **snapshot → act → re-snapshot** loop. Navigate only when you need a NEW URL.
 
-Before every action, follow this sequence:
+**CRITICAL RULES:**
+- **Navigate ONLY when going to a NEW URL.** If you are already on the page, DO NOT call `page.goto()` again — it reloads the page and destroys filled forms, scroll position, and dynamic state.
+- **After EVERY action (click, fill, type), re-snapshot** to see updated refs. Old refs become invalid after the DOM changes.
+- **Never use refs from a previous snapshot** after navigating or clicking a link that changes the page.
 
-1. **Navigate** — `await page.goto('https://...')` — always navigate before observing. `snapshotAI()` on a blank page returns an empty result.
-2. **Dismiss overlays & accept cookies** — after every `page.goto()`, call `await browser.dismissOverlays()` to auto-close cookie banners, consent popups, and notification prompts. If a cookie banner or consent dialog is still visible in the snapshot, click "Accept" / "Accept all" / "Принять" before doing anything else. Never skip this step — cookie overlays block interaction with page elements underneath.
-3. **Snapshot** — `const { snapshot } = await browser.snapshotAI()` to see the page with refs
-4. **Read text** — `await browser.extractText()` if you need clean readable text (menus, prices, articles)
-5. **Visual check** — `await browser.takeScreenshot()` only if you need to see colors, layout, maps, or images
-6. **Act by ref** — `await browser.clickRef('e4')`, `await browser.fillRef('e5', 'text')` etc.
-7. **Verify** — `await browser.snapshotAI()` again to confirm the action worked
-8. **Batch** — use `batchActions()` for multi-step flows
+#### When to navigate vs when to just snapshot
+
+| Situation | What to do |
+|-----------|-----------|
+| First visit to a site | `page.goto(url)` then `snapshotAI()` |
+| Already on the page, need to click/fill | Just `snapshotAI()` then act — do NOT goto again |
+| Clicked a link that navigated to a new page | Wait for load, then `snapshotAI()` — do NOT goto |
+| Need to go to a completely different URL | `page.goto(newUrl)` then `snapshotAI()` |
+| Form is partially filled, need to continue | Just `snapshotAI()` — do NOT goto (it clears the form!) |
+| Page loaded but button not visible | Scroll down with `scrollDown()` then `snapshotAI()` |
+
+#### The loop
+
+```
+1. SNAPSHOT  →  snapshotAI() to see what's on the page
+2. FIND      →  locate the target element ref in the snapshot
+3. ACT       →  clickRef / fillRef / typeRef / etc.
+4. WAIT      →  if the action triggers navigation: sleep(1000-2000)
+5. GO TO 1   →  re-snapshot to see updated state and get fresh refs
+```
+
+#### First visit to a new URL
+
+```javascript
+// Step 1: Navigate (ONLY for new URLs)
+await page.goto('https://example.com');
+
+// Step 2: Dismiss cookie banners / overlays
+// Look for "Accept" / "Accept all" / "Agree" in the snapshot and click it
+const { snapshot } = await browser.snapshotAI();
+// If you see a cookie banner ref, click it first:
+// await browser.clickRef('e2');  // "Accept all cookies"
+
+// Step 3: Now work with the page
+const { snapshot: clean } = await browser.snapshotAI();
+await browser.fillRef('e4', 'user@example.com');
+// ...
+```
+
+#### Continuing on the same page (NO navigation!)
+
+```javascript
+// WRONG — reloads page, loses form state!
+await page.goto('https://example.com/form');  // ← DO NOT DO THIS if already on this page
+const { snapshot } = await browser.snapshotAI();
+
+// RIGHT — just snapshot the current state
+const { snapshot } = await browser.snapshotAI();
+await browser.fillRef('e5', 'password');
+await browser.clickRef('e8');  // Submit
+// Wait for result, then re-snapshot
+await browser.sleep(1500);
+const { snapshot: result } = await browser.snapshotAI();
+```
+
+#### When an element is not found
+
+If the element you need is not in the snapshot:
+
+1. **Snapshot was truncated** (`truncated: true`) → scroll down and re-snapshot:
+   ```javascript
+   await browser.scrollDown();
+   const { snapshot } = await browser.snapshotAI();
+   ```
+2. **Overlay/modal is blocking** → find and close it (click "X" or "Accept"):
+   ```javascript
+   await browser.clickRef('e2');  // Close modal
+   const { snapshot } = await browser.snapshotAI();
+   ```
+3. **Page still loading** → wait and re-snapshot:
+   ```javascript
+   await browser.sleep(2000);
+   const { snapshot } = await browser.snapshotAI();
+   ```
+4. **Element requires interaction to appear** (dropdown, hover menu) → trigger it:
+   ```javascript
+   await browser.clickRef('e5');  // Open dropdown
+   const { snapshot } = await browser.snapshotAI();  // Now see dropdown items
+   ```
 
 ### Targeting elements — use refs from snapshotAI()
 
@@ -449,19 +524,40 @@ CN_NO_PROXY=1
 
 **Key fact: `launchBrowser()` always returns the SAME tab.** Calling it multiple times does NOT create new tabs or pages — it reconnects to the existing browser and returns the active tab with all cookies and login sessions intact. This is the intended behavior.
 
+### How it works between separate script runs
+
+A background **daemon process** keeps Chromium alive independently of your script. When your script ends, the daemon stays running. The next script's `launchBrowser()` reconnects to the **same daemon → same browser → same tab → same page state**.
+
+You do NOT need to:
+- Execute all steps in one long script
+- Keep a long-running process
+- Do anything special to preserve state
+
+Just call `launchBrowser()` at the start of each script and **NEVER call `closeBrowser()`**. That's it.
+
+```
+Message 1 → script runs → launchBrowser() → daemon starts → goto, click, fill → script ends
+                                               ↑ daemon stays alive, browser stays alive
+Message 2 → script runs → launchBrowser() → connects to SAME daemon → same tab, same page
+Message 3 → script runs → launchBrowser() → connects to SAME daemon → same tab, same page
+```
+
 ```javascript
 // Script 1: agent logs into a site
 const b = await launchBrowser({ country: 'us' });
-await b.page.goto('https://example.com/login');
+await b.page.goto('https://example.com/login');  // First visit — navigate
+await b.dismissOverlays();
+const { snapshot } = await b.snapshotAI();
 await b.fillRef('e2', 'user@example.com');
 await b.clickRef('e5');
-// Script ends — browser stays alive
+// Script ends — browser stays alive. DO NOT call closeBrowser().
 
-// Script 2 (later): agent continues where it left off
+// Script 2 (later, SEPARATE script run): agent continues where it left off
 const b = await launchBrowser({ country: 'us' });
 // Same browser, SAME TAB, same cookies — still logged in
-// b.page is the exact same page object as before
-await b.snapshotAI();  // sees the logged-in page
+// DO NOT call page.goto() again — just snapshot to see current state!
+const { snapshot } = await b.snapshotAI();  // sees the logged-in page
+// Continue working from here
 ```
 
 ### Calling launchBrowser() multiple times is safe
@@ -503,15 +599,21 @@ const b = await launchBrowser({
   headless: true,
 });
 
-// Browse normally — anti-detection is automatic
+// Step 1: Navigate to the site (ONLY on first visit)
 await b.page.goto('https://example.com');
 
-// Read the page
+// Step 2: Dismiss cookie banners
+await b.dismissOverlays();
+
+// Step 3: Snapshot to see the page
 const { snapshot } = await b.snapshotAI();
 
-// Interact by ref
+// Step 4: Interact by ref
 await b.fillRef('e4', 'user@example.com');
 await b.clickRef('e6');
+
+// Step 5: Re-snapshot to verify (DO NOT call page.goto again!)
+const { snapshot: after } = await b.snapshotAI();
 
 // Solve CAPTCHA if present
 const result = await b.solveCaptcha({ verbose: true });
@@ -520,6 +622,7 @@ const result = await b.solveCaptcha({ verbose: true });
 const ss = await b.takeScreenshot();
 
 // DO NOT close — browser stays alive for the next step
+// Next message: just call snapshotAI() — no need to navigate again!
 ```
 
 ## API Reference
@@ -550,7 +653,7 @@ Launch a stealth Chromium browser with residential proxy.
 | `logLevel` | string | `'actions'` | `'off'` \| `'actions'` \| `'verbose'`. Env: `CN_LOG_LEVEL` |
 | `task` | string | `null` | User's prompt / task description. Recorded in the session log for context. |
 
-Returns: `{ browser, ctx, page, logger, tabId, newTab, listTabs, closeTab, switchTab, humanClick, humanMouseMove, humanType, humanScroll, humanRead, solveCaptcha, takeScreenshot, screenshotAndReport, snapshot, snapshotAI, dumpInteractiveElements, clickRef, fillRef, typeRef, selectRef, hoverRef, extractText, getCookies, setCookies, clearCookies, batchActions, sleep, rand, getSessionLog }`
+Returns: `{ browser, ctx, page, logger, tabId, newTab, listTabs, closeTab, switchTab, humanClick, humanMouseMove, humanType, humanScroll, humanRead, solveCaptcha, takeScreenshot, screenshotAndReport, takeScreenshotWithLabels, snapshot, snapshotAI, dumpInteractiveElements, clickRef, fillRef, typeRef, selectRef, hoverRef, refLocator, scrollDown, scrollUp, dismissOverlays, extractText, getConsoleMessages, getPageErrors, getNetworkRequests, getCookies, setCookies, clearCookies, batchActions, sleep, rand, getSessionLog }`
 
 ### `solveCaptcha(page, opts)`
 
@@ -605,15 +708,28 @@ Returns a structured accessibility tree with embedded `[ref=eN]` annotations. Us
 ```javascript
 const { snapshot, refs, truncated } = await browser.snapshotAI();
 // snapshot: "- heading \"Welcome\" [ref=e1]\n- textbox \"Email\" [ref=e2]\n- button \"Sign in\" [ref=e3]"
-// refs: { e1: true, e2: true, e3: true }
+// refs: { e1: { role: 'heading', name: 'Welcome' }, e2: { role: 'textbox', name: 'Email' }, e3: { role: 'button', name: 'Sign in' } }
+
+// Scoped snapshots — reduce token count for large pages:
+const { snapshot: interactive } = await browser.snapshotAI({ interactiveOnly: true });
+// Only buttons, inputs, links, selects — strips static text
+const { snapshot: compact } = await browser.snapshotAI({ compact: true });
+// Strips structural noise (generic, group, none, presentation roles)
+const { snapshot: shallow } = await browser.snapshotAI({ maxDepth: 3 });
+// Only top 3 levels of nesting
 ```
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `maxChars` | number | `20000` | Truncate snapshot to N characters |
 | `timeout` | number | `5000` | Playwright timeout in ms |
+| `interactiveOnly` | boolean | `false` | Keep only interactive elements (buttons, inputs, links, selects) |
+| `compact` | boolean | `false` | Strip structural noise roles (generic, group, none, presentation) |
+| `maxDepth` | number | `0` | Max nesting depth (0 = unlimited). Use 2-4 for large pages |
 
 Returns: `{ snapshot: string, refs: Object, truncated?: boolean }`
+
+**Refs format:** Each ref is `{ role, name }` — e.g., `refs.e3` = `{ role: 'button', name: 'Sign in' }`. Use with `refLocator()` for semantic locators that survive DOM changes.
 
 ### `clickRef(ref, opts)` — Click element by ref
 
@@ -647,6 +763,126 @@ await browser.selectRef('e5', 'US');
 ```javascript
 await browser.hoverRef('e1');  // reveal tooltip/dropdown
 ```
+
+### `scrollDown(opts)` — Scroll page down
+
+Scroll down by one viewport height (or custom pixels). Use when `snapshotAI()` returns `truncated: true` and the element you need is below the fold.
+
+```javascript
+await browser.scrollDown();                    // one viewport height
+await browser.scrollDown({ pixels: 500 });     // 500px
+```
+
+### `scrollUp(opts)` — Scroll page up
+
+```javascript
+await browser.scrollUp();                      // one viewport height
+await browser.scrollUp({ pixels: 500 });       // 500px
+```
+
+### `dismissOverlays()` — Dismiss cookie banners & popups
+
+Auto-clicks common "Accept" / "Close" / "Got it" buttons on cookie banners, consent popups, and notification prompts. Safe to call multiple times.
+
+```javascript
+const { dismissed } = await browser.dismissOverlays();
+// dismissed: number of overlays closed
+```
+
+Call this after `page.goto()` and before `snapshotAI()` on first visit to a site. If a cookie banner is still visible in the snapshot, manually click the "Accept" ref.
+
+### `refLocator(page, ref, refMeta)` — Semantic locator from ref metadata
+
+Build a Playwright locator from the rich ref metadata returned by `snapshotAI()`. Falls back to `aria-ref` if no role/name metadata is available.
+
+```javascript
+const { refs } = await browser.snapshotAI();
+// refs.e3 = { role: 'button', name: 'Sign in' }
+const locator = browser.refLocator(page, 'e3', refs.e3);
+// → page.getByRole('button', { name: 'Sign in' }).first()
+// Falls back to: page.locator('aria-ref=e3')
+```
+
+Use this when you need a locator that survives minor DOM changes (e.g., for assertions or waiting).
+
+### `takeScreenshotWithLabels(page, refs, opts)` — Labeled screenshot
+
+Take a screenshot with orange ref labels overlaid on each element. Useful for visual debugging — shows where each ref points on the page.
+
+```javascript
+const { snapshot, refs } = await browser.snapshotAI();
+const { base64, labels, skipped } = await browser.takeScreenshotWithLabels(refs);
+// base64: PNG with orange labels ("e1", "e2", ...) next to each element
+// labels: [{ ref: 'e1', x: 100, y: 200, role: 'button', name: 'Submit' }, ...]
+// skipped: ['e15', 'e16']  — refs not visible in viewport
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `fullPage` | boolean | `false` | Capture full scrollable page |
+
+### `getConsoleMessages(opts)` — Read browser console
+
+Returns console messages (log, warn, error, info, debug) captured since page load.
+
+```javascript
+const { messages, total } = await browser.getConsoleMessages();
+// All messages since page load
+
+const { messages } = await browser.getConsoleMessages({ type: 'error', last: 10 });
+// Last 10 error messages only
+
+const { messages } = await browser.getConsoleMessages({ pattern: 'API|fetch' });
+// Messages matching a regex pattern
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `type` | string | - | Filter by type: `'log'`, `'warn'`, `'error'`, `'info'`, `'debug'` |
+| `last` | number | all | Return only the last N messages |
+| `pattern` | string | - | Regex pattern to filter message text |
+
+Returns: `{ messages: [{ type, text, ts }], total: number }`
+
+### `getPageErrors(opts)` — Read uncaught page errors
+
+Returns uncaught JavaScript errors (exceptions, unhandled promise rejections) captured since page load.
+
+```javascript
+const { errors, total } = await browser.getPageErrors();
+// errors: [{ message: 'TypeError: Cannot read...', ts: '...' }, ...]
+const { errors } = await browser.getPageErrors({ last: 5 });
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `last` | number | all | Return only the last N errors |
+
+Returns: `{ errors: [{ message, ts }], total: number }`
+
+### `getNetworkRequests(opts)` — Read network activity
+
+Returns HTTP requests/responses captured since page load. Useful for debugging API calls, checking for failed requests, and understanding page behavior.
+
+```javascript
+const { requests, total } = await browser.getNetworkRequests();
+// All requests since page load
+
+const { requests } = await browser.getNetworkRequests({ failedOnly: true });
+// Only failed requests (network errors, no response)
+
+const { requests } = await browser.getNetworkRequests({ urlPattern: '/api/', method: 'POST', last: 20 });
+// Last 20 POST requests to /api/ endpoints
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `last` | number | all | Return only the last N requests |
+| `urlPattern` | string | - | Filter by URL substring |
+| `method` | string | - | Filter by HTTP method (GET, POST, etc.) |
+| `failedOnly` | boolean | `false` | Only failed requests (no response received) |
+
+Returns: `{ requests: [{ method, url, status, failure, ts }], total: number }`
 
 ### `newTab(opts)` — Open a new tab
 

@@ -1250,6 +1250,11 @@ function buildDaemonResult(daemonPort, logger, tabId = null) {
       return { message, screenshot: r.base64, mimeType: 'image/png' };
     },
 
+    takeScreenshotWithLabels: async (refs, opts) => {
+      const r = await post('/screenshotWithLabels', _t({ refs, ...(opts || {}) }));
+      return { base64: r.base64, labels: r.labels, skipped: r.skipped };
+    },
+
     // Observation layer
     snapshot:                (opts) => post('/snapshot', _t(opts || {})).then(r => r.snapshot),
     snapshotAI:              (opts) => post('/snapshotAI', _t(opts || {})),
@@ -1262,6 +1267,13 @@ function buildDaemonResult(daemonPort, logger, tabId = null) {
     selectRef: (ref, value, opts) => post('/selectRef', _t({ ref, value, ...(opts || {}) })),
     hoverRef:  (ref, opts) => post('/hoverRef',  _t({ ref, ...(opts || {}) })),
 
+    // Scroll helpers
+    scrollDown:      (opts) => post('/scrollDown', _t(opts || {})),
+    scrollUp:        (opts) => post('/scrollUp', _t(opts || {})),
+
+    // Dismiss overlays
+    dismissOverlays: () => post('/dismissOverlays', _t({})),
+
     // Text extraction
     extractText: (opts) => post('/extractText', _t(opts || {})),
 
@@ -1272,6 +1284,11 @@ function buildDaemonResult(daemonPort, logger, tabId = null) {
 
     // Batch actions
     batchActions: (actions, opts) => post('/batchActions', _t({ actions, ...(opts || {}) })),
+
+    // Page state: console, errors, network
+    getConsoleMessages: (opts) => post('/consoleMessages', _t(opts || {})),
+    getPageErrors:      (opts) => post('/pageErrors', _t(opts || {})),
+    getNetworkRequests: (opts) => post('/networkRequests', _t(opts || {})),
 
     sleep,
     rand,
@@ -1363,6 +1380,77 @@ async function takeScreenshot(pg, opts = {}) {
 async function screenshotAndReport(pg, message, opts = {}) {
   const screenshot = await takeScreenshot(pg, opts);
   return { message, screenshot, mimeType: 'image/png' };
+}
+
+/**
+ * Take a screenshot with labeled overlays showing ref IDs on each element.
+ * Injects temporary orange-bordered boxes with ref labels (#ffb020),
+ * takes a screenshot, then cleans up the overlays.
+ *
+ * @param {import('playwright').Page} page
+ * @param {Object} refs — Ref metadata from snapshotAI() { e1: { role, name }, ... }
+ * @param {Object} [opts]
+ * @param {boolean} [opts.fullPage=false]
+ * @param {number} [opts.maxLabels=150] — Max labels to render
+ * @returns {Promise<{ base64: string, labels: number, skipped: number }>}
+ */
+async function takeScreenshotWithLabels(page, refs, opts = {}) {
+  const { fullPage = false, maxLabels = 150 } = opts;
+  const refIds = Object.keys(refs || {});
+  if (refIds.length === 0) {
+    return { base64: await takeScreenshot(page, { fullPage }), labels: 0, skipped: 0 };
+  }
+
+  const viewport = page.viewportSize() || { width: 1280, height: 800 };
+  const boxes = [];
+
+  // Step 1: Get bounding boxes via Playwright locators
+  for (const refId of refIds) {
+    if (boxes.length >= maxLabels) break;
+    try {
+      const box = await page.locator(`aria-ref=${refId}`).boundingBox({ timeout: 500 });
+      if (!box) continue;
+      // Filter: only visible in viewport
+      if (box.y + box.height > 0 && box.y < viewport.height &&
+          box.x + box.width > 0 && box.x < viewport.width) {
+        boxes.push({ refId, x: box.x, y: box.y, width: box.width, height: box.height });
+      }
+    } catch (_) { /* element not found or not visible */ }
+  }
+
+  const skipped = refIds.length - boxes.length;
+  if (boxes.length === 0) {
+    return { base64: await takeScreenshot(page, { fullPage }), labels: 0, skipped };
+  }
+
+  // Step 2: Inject overlay divs
+  const overlayId = '_cn_labels_' + Date.now();
+  await page.evaluate(({ boxes, overlayId }) => {
+    const container = document.createElement('div');
+    container.id = overlayId;
+    container.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;z-index:2147483647;pointer-events:none;font-family:monospace;';
+    for (const box of boxes) {
+      const el = document.createElement('div');
+      el.style.cssText = `position:fixed;left:${box.x}px;top:${box.y}px;width:${box.width}px;height:${box.height}px;border:2px solid #ffb020;box-sizing:border-box;pointer-events:none;`;
+      const label = document.createElement('div');
+      label.textContent = box.refId;
+      label.style.cssText = 'position:absolute;top:-16px;left:-1px;background:#ffb020;color:#000;font:bold 10px/14px monospace;padding:0 3px;border-radius:2px 2px 0 0;white-space:nowrap;';
+      el.appendChild(label);
+      container.appendChild(el);
+    }
+    document.documentElement.appendChild(container);
+  }, { boxes, overlayId });
+
+  // Step 3: Take screenshot
+  const base64 = await takeScreenshot(page, { fullPage });
+
+  // Step 4: Clean up
+  await page.evaluate((id) => {
+    const el = document.getElementById(id);
+    if (el) el.remove();
+  }, overlayId).catch(() => {});
+
+  return { base64, labels: boxes.length, skipped };
 }
 
 // ── PAGE PROXY ──────────────────────────────────────────────────────────────
@@ -1522,8 +1610,9 @@ function _createLoggingProxy(target, logger, rawPage, chain = []) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function buildResult(browser, ctx, page, logger) {
-  // ── Create logging proxy for the page object ──
+  // ── Attach page state tracking for console/network/error monitoring ──
   const rawPage = page;  // keep unwrapped reference for internal use
+  ensurePageState(rawPage);
   const proxiedPage = logger.level !== 'off'
     ? _createLoggingProxy(page, logger, rawPage)
     : page;
@@ -1623,6 +1712,11 @@ function buildResult(browser, ctx, page, logger) {
     solveCaptcha:   wrap('solveCaptcha', (captchaOpts) => solveCaptcha(rawPage, captchaOpts)),
     takeScreenshot: wrappedScreenshot,
     screenshotAndReport: wrappedScreenshotAndReport,
+    takeScreenshotWithLabels: async (refs, opts) => {
+      const result = await takeScreenshotWithLabels(rawPage, refs, opts);
+      if (logger.level !== 'off') logger.log('screenshotWithLabels', { labels: result.labels, skipped: result.skipped, url: _safeUrl(rawPage) });
+      return result;
+    },
 
     // Observation layer — use these instead of page.textContent()
     snapshot:               wrappedSnapshot,
@@ -1630,11 +1724,19 @@ function buildResult(browser, ctx, page, logger) {
     dumpInteractiveElements: wrappedDumpInteractive,
 
     // Ref-based interactions — use refs from snapshotAI() output
+    refLocator:     (ref, refMeta) => refLocator(rawPage, ref, refMeta),
     clickRef:       wrap('clickRef', (ref, opts) => clickRef(rawPage, ref, opts)),
     fillRef:        wrap('fillRef', (ref, value, opts) => fillRef(rawPage, ref, value, opts)),
     typeRef:        wrap('typeRef', (ref, text, opts) => typeRef(rawPage, ref, text, opts)),
     selectRef:      wrap('selectRef', (ref, value, opts) => selectRef(rawPage, ref, value, opts)),
     hoverRef:       wrap('hoverRef', (ref, opts) => hoverRef(rawPage, ref, opts)),
+
+    // Scroll helpers — use when snapshot is truncated or element not visible
+    scrollDown:     wrap('scrollDown', (opts) => scrollDown(rawPage, opts)),
+    scrollUp:       wrap('scrollUp', (opts) => scrollUp(rawPage, opts)),
+
+    // Dismiss cookie banners, consent popups, notification prompts
+    dismissOverlays: wrap('dismissOverlays', () => dismissOverlays(rawPage)),
 
     // Text extraction — clean readable text from pages
     extractText:    wrap('extractText', (opts) => extractText(rawPage, opts)),
@@ -1646,6 +1748,11 @@ function buildResult(browser, ctx, page, logger) {
 
     // Batch actions — execute multiple actions in one call
     batchActions:   wrap('batchActions', (actions, opts) => batchActions(rawPage, actions, opts)),
+
+    // Page state: console messages, errors, network requests
+    getConsoleMessages: (opts) => getConsoleMessages(rawPage, opts),
+    getPageErrors:      (opts) => getPageErrors(rawPage, opts),
+    getNetworkRequests: (opts) => getNetworkRequests(rawPage, opts),
 
     sleep, rand,
     getSessionLog:  () => logger.getLog(),
@@ -1932,6 +2039,136 @@ async function _dumpInteractiveElementsDOM(page) {
   });
 }
 
+// ─── PAGE STATE TRACKING ──────────────────────────────────────────────────
+// Attaches page event listeners to capture console messages, page errors,
+// and network requests in ring buffers for runtime inspection.
+
+const _pageStates = new WeakMap();
+const PAGE_STATE_LIMITS = { console: 500, errors: 200, network: 500 };
+
+/**
+ * Ensure a page has state tracking attached. Idempotent — safe to call repeatedly.
+ * Captures console messages, uncaught exceptions, and network requests.
+ *
+ * @param {import('playwright').Page} page
+ * @returns {{ console: Array, errors: Array, network: Array }}
+ */
+function ensurePageState(page) {
+  if (_pageStates.has(page)) return _pageStates.get(page);
+
+  const state = { console: [], errors: [], network: [] };
+  const pendingReqs = new WeakMap();
+  _pageStates.set(page, state);
+
+  page.on('console', (msg) => {
+    if (state.console.length >= PAGE_STATE_LIMITS.console) state.console.shift();
+    state.console.push({
+      type: msg.type(),
+      text: msg.text().slice(0, 1000),
+      ts: new Date().toISOString(),
+    });
+  });
+
+  page.on('pageerror', (err) => {
+    if (state.errors.length >= PAGE_STATE_LIMITS.errors) state.errors.shift();
+    state.errors.push({
+      message: (err.message || String(err)).slice(0, 2000),
+      stack: (err.stack || '').slice(0, 1000),
+      ts: new Date().toISOString(),
+    });
+  });
+
+  page.on('request', (req) => {
+    pendingReqs.set(req, Date.now());
+  });
+
+  page.on('response', (resp) => {
+    const req = resp.request();
+    const startTs = pendingReqs.get(req);
+    if (state.network.length >= PAGE_STATE_LIMITS.network) state.network.shift();
+    state.network.push({
+      url: resp.url().slice(0, 500),
+      method: req.method(),
+      status: resp.status(),
+      resourceType: req.resourceType(),
+      duration: startTs ? Date.now() - startTs : null,
+      ts: new Date().toISOString(),
+    });
+  });
+
+  page.on('requestfailed', (req) => {
+    const startTs = pendingReqs.get(req);
+    if (state.network.length >= PAGE_STATE_LIMITS.network) state.network.shift();
+    state.network.push({
+      url: req.url().slice(0, 500),
+      method: req.method(),
+      status: 0,
+      resourceType: req.resourceType(),
+      error: (req.failure()?.errorText || 'unknown').slice(0, 200),
+      duration: startTs ? Date.now() - startTs : null,
+      ts: new Date().toISOString(),
+    });
+  });
+
+  return state;
+}
+
+/**
+ * Get console messages captured from a page.
+ *
+ * @param {import('playwright').Page} page
+ * @param {Object} [opts]
+ * @param {string} [opts.type] — Filter by type: 'log', 'error', 'warning', 'info'
+ * @param {number} [opts.last=50] — Return only the last N messages
+ * @param {string} [opts.pattern] — Filter by text pattern (case-insensitive regex)
+ * @returns {{ messages: Array, total: number }}
+ */
+function getConsoleMessages(page, opts = {}) {
+  const state = ensurePageState(page);
+  let msgs = state.console;
+  if (opts.type) msgs = msgs.filter(m => m.type === opts.type);
+  if (opts.pattern) {
+    const re = new RegExp(opts.pattern, 'i');
+    msgs = msgs.filter(m => re.test(m.text));
+  }
+  const total = msgs.length;
+  return { messages: msgs.slice(-(opts.last || 50)), total };
+}
+
+/**
+ * Get page errors (uncaught exceptions) captured from a page.
+ *
+ * @param {import('playwright').Page} page
+ * @param {Object} [opts]
+ * @param {number} [opts.last=50]
+ * @returns {{ errors: Array, total: number }}
+ */
+function getPageErrors(page, opts = {}) {
+  const state = ensurePageState(page);
+  return { errors: state.errors.slice(-(opts.last || 50)), total: state.errors.length };
+}
+
+/**
+ * Get network requests captured from a page.
+ *
+ * @param {import('playwright').Page} page
+ * @param {Object} [opts]
+ * @param {number} [opts.last=50]
+ * @param {string} [opts.urlPattern] — Filter by URL substring
+ * @param {string} [opts.method] — Filter by HTTP method
+ * @param {boolean} [opts.failedOnly=false] — Only failed/4xx/5xx requests
+ * @returns {{ requests: Array, total: number }}
+ */
+function getNetworkRequests(page, opts = {}) {
+  const state = ensurePageState(page);
+  let reqs = state.network;
+  if (opts.urlPattern) reqs = reqs.filter(r => r.url.includes(opts.urlPattern));
+  if (opts.method) reqs = reqs.filter(r => r.method === opts.method.toUpperCase());
+  if (opts.failedOnly) reqs = reqs.filter(r => r.status === 0 || r.status >= 400);
+  const total = reqs.length;
+  return { requests: reqs.slice(-(opts.last || 50)), total };
+}
+
 // ─── OBSERVATION LAYER ───────────────────────────────────────────────────────
 // Use snapshot() instead of page.textContent() — 90-95% fewer tokens for LLMs.
 // The accessibility tree gives the agent structured, semantic understanding of
@@ -2001,6 +2238,37 @@ function filterInteractiveOnly(yaml) {
 }
 
 /**
+ * Strip unnamed structural elements from a snapshot to reduce noise.
+ * Removes lines like "- generic:", "- group:", "- none:" that are pure
+ * wrappers without semantic value. Children keep their original indentation.
+ *
+ * @param {string} text — Snapshot text (AI or YAML)
+ * @returns {string} Compacted snapshot
+ */
+function compactSnapshot(text) {
+  const NOISE = /^(\s*)-\s+(generic|group|none|presentation)\s*:?\s*$/;
+  return text.split('\n').filter(line => !NOISE.test(line)).join('\n');
+}
+
+/**
+ * Limit the tree depth of a snapshot by indentation level.
+ * Lines indented deeper than maxDepth levels are removed.
+ *
+ * @param {string} text — Snapshot text
+ * @param {number} maxDepth — Maximum nesting depth (1 = top-level only)
+ * @returns {string} Depth-limited snapshot
+ */
+function limitDepth(text, maxDepth) {
+  const maxIndent = maxDepth * 2; // 2 spaces per indent level
+  return text.split('\n')
+    .filter(line => {
+      const indent = line.length - line.trimStart().length;
+      return indent < maxIndent || !line.trim();
+    })
+    .join('\n');
+}
+
+/**
  * Capture a compact accessibility tree snapshot of the page or a region.
  * Returns a YAML string with roles, names, and attributes — structured
  * semantic understanding of the page that LLMs can reason about.
@@ -2066,7 +2334,13 @@ async function snapshot(page, opts = {}) {
  * @returns {Promise<{snapshot: string, refs: Object<string, boolean>, truncated?: boolean}>}
  */
 async function snapshotAI(page, opts = {}) {
-  const { maxChars = 20000, timeout = 5000 } = opts;
+  const {
+    maxChars = 20000,
+    timeout = 5000,
+    interactiveOnly = false,
+    compact = false,
+    maxDepth = 0,
+  } = opts;
 
   // Guard: warn if page is blank (agent forgot to navigate first)
   try {
@@ -2093,17 +2367,37 @@ async function snapshotAI(page, opts = {}) {
   let snap = String(result?.full ?? '');
   let truncated = false;
 
+  // Post-process: filter/transform the snapshot text
+  if (interactiveOnly) {
+    snap = filterInteractiveOnly(snap);
+  }
+  if (compact) {
+    snap = compactSnapshot(snap);
+  }
+  if (maxDepth > 0) {
+    snap = limitDepth(snap, maxDepth);
+  }
+
   if (maxChars && snap.length > maxChars) {
     snap = snap.slice(0, maxChars) + '\n\n[...TRUNCATED - page too large]';
     truncated = true;
   }
 
-  // Parse ref IDs from snapshot text: [ref=eN]
+  // Parse ref IDs with rich metadata: role, name from "- role "name" [ref=eN]"
   const refs = {};
-  const refRegex = /\[ref=(e\d+)\]/g;
-  let m;
-  while ((m = refRegex.exec(snap)) !== null) {
-    refs[m[1]] = true;
+  const lines = snap.split('\n');
+  for (const line of lines) {
+    const refMatch = line.match(/\[ref=(e\d+)\]/);
+    if (!refMatch) continue;
+    const refId = refMatch[1];
+    const trimmed = line.trimStart();
+    // Parse "- role "Name" ..." or "- role ..."
+    const roleMatch = trimmed.match(/^-\s+(\w+)(?:\s+"([^"]*)")?/);
+    if (roleMatch) {
+      refs[refId] = { role: roleMatch[1], name: roleMatch[2] || '' };
+    } else {
+      refs[refId] = true;
+    }
   }
 
   return { snapshot: snap, refs, truncated: truncated || undefined };
@@ -2113,6 +2407,31 @@ async function snapshotAI(page, opts = {}) {
 // Click, fill, and type using [ref=eN] from snapshotAI() output.
 // Uses Playwright's aria-ref locator which resolves refs from the last
 // _snapshotForAI() call automatically.
+
+/**
+ * Resolve a ref to a Playwright locator. When rich ref metadata is provided
+ * (from snapshotAI's refs), tries getByRole first (survives minor DOM changes),
+ * then falls back to aria-ref (exact snapshot match).
+ *
+ * This is a utility for advanced use. The standard clickRef/fillRef/etc.
+ * functions use aria-ref directly, which is sufficient for most cases.
+ *
+ * @param {import('playwright').Page} page
+ * @param {string} ref — Ref ID (e.g. "e4")
+ * @param {Object|boolean} [refMeta] — Rich ref metadata { role, name } from snapshotAI().refs
+ * @returns {import('playwright').Locator}
+ */
+function refLocator(page, ref, refMeta) {
+  if (refMeta && typeof refMeta === 'object' && refMeta.role) {
+    try {
+      const opts = refMeta.name ? { name: refMeta.name } : undefined;
+      return page.getByRole(refMeta.role, opts).first();
+    } catch (_) {
+      // getByRole may not support all roles — fall through to aria-ref
+    }
+  }
+  return page.locator(`aria-ref=${ref}`);
+}
 
 /**
  * Click an element by its ref ID from a previous snapshotAI() call.
@@ -2127,11 +2446,21 @@ async function snapshotAI(page, opts = {}) {
 async function clickRef(page, ref, opts = {}) {
   const { timeout = 8000, button = 'left', doubleClick = false } = opts;
   const locator = page.locator(`aria-ref=${ref}`);
-  if (doubleClick) {
-    await locator.dblclick({ timeout, button });
-  } else {
-    await locator.click({ timeout, button });
+  try {
+    if (doubleClick) {
+      await locator.dblclick({ timeout, button });
+    } else {
+      await locator.click({ timeout, button });
+    }
+  } catch (err) {
+    throw new Error(
+      `clickRef("${ref}") failed: element not found or not visible. ` +
+      `Take a fresh snapshotAI() to see current page elements and use an updated ref. ` +
+      `Original error: ${err.message}`
+    );
   }
+  // Wait for page to stabilize after click (navigation, SPA route change, dynamic updates)
+  await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
 }
 
 /**
@@ -2146,7 +2475,15 @@ async function clickRef(page, ref, opts = {}) {
 async function fillRef(page, ref, value, opts = {}) {
   const { timeout = 8000 } = opts;
   const locator = page.locator(`aria-ref=${ref}`);
-  await locator.fill(value, { timeout });
+  try {
+    await locator.fill(value, { timeout });
+  } catch (err) {
+    throw new Error(
+      `fillRef("${ref}") failed: element not found, not visible, or not fillable. ` +
+      `Take a fresh snapshotAI() to see current page elements and use an updated ref. ` +
+      `Original error: ${err.message}`
+    );
+  }
 }
 
 /**
@@ -2163,14 +2500,22 @@ async function fillRef(page, ref, value, opts = {}) {
 async function typeRef(page, ref, text, opts = {}) {
   const { slowly = false, submit = false, timeout = 8000 } = opts;
   const locator = page.locator(`aria-ref=${ref}`);
-  if (slowly) {
-    await locator.click({ timeout });
-    await locator.type(text, { timeout, delay: 75 });
-  } else {
-    await locator.fill(text, { timeout });
-  }
-  if (submit) {
-    await locator.press('Enter', { timeout });
+  try {
+    if (slowly) {
+      await locator.click({ timeout });
+      await locator.type(text, { timeout, delay: 75 });
+    } else {
+      await locator.fill(text, { timeout });
+    }
+    if (submit) {
+      await locator.press('Enter', { timeout });
+    }
+  } catch (err) {
+    throw new Error(
+      `typeRef("${ref}") failed: element not found, not visible, or not typeable. ` +
+      `Take a fresh snapshotAI() to see current page elements and use an updated ref. ` +
+      `Original error: ${err.message}`
+    );
   }
 }
 
@@ -2186,7 +2531,15 @@ async function typeRef(page, ref, text, opts = {}) {
 async function selectRef(page, ref, value, opts = {}) {
   const { timeout = 8000 } = opts;
   const locator = page.locator(`aria-ref=${ref}`);
-  await locator.selectOption(value, { timeout });
+  try {
+    await locator.selectOption(value, { timeout });
+  } catch (err) {
+    throw new Error(
+      `selectRef("${ref}") failed: element not found, not visible, or not a <select>. ` +
+      `Take a fresh snapshotAI() to see current page elements and use an updated ref. ` +
+      `Original error: ${err.message}`
+    );
+  }
 }
 
 /**
@@ -2200,7 +2553,99 @@ async function selectRef(page, ref, value, opts = {}) {
 async function hoverRef(page, ref, opts = {}) {
   const { timeout = 8000 } = opts;
   const locator = page.locator(`aria-ref=${ref}`);
-  await locator.hover({ timeout });
+  try {
+    await locator.hover({ timeout });
+  } catch (err) {
+    throw new Error(
+      `hoverRef("${ref}") failed: element not found or not visible. ` +
+      `Take a fresh snapshotAI() to see current page elements and use an updated ref. ` +
+      `Original error: ${err.message}`
+    );
+  }
+}
+
+// ─── SCROLL HELPERS ─────────────────────────────────────────────────────────
+// Scroll the page and optionally re-snapshot. Used when snapshotAI() returns
+// truncated output and the agent needs to see elements further down the page.
+
+/**
+ * Scroll the page down by one viewport height.
+ *
+ * @param {import('playwright').Page} page
+ * @param {Object} [opts]
+ * @param {number} [opts.pixels] — Scroll by N pixels instead of one viewport
+ * @returns {Promise<void>}
+ */
+async function scrollDown(page, opts = {}) {
+  const px = opts.pixels || 0;
+  await page.evaluate((p) => {
+    window.scrollBy(0, p || window.innerHeight);
+  }, px);
+  // Brief pause for lazy-loaded content to appear
+  await page.waitForTimeout(300);
+}
+
+/**
+ * Scroll the page up by one viewport height.
+ *
+ * @param {import('playwright').Page} page
+ * @param {Object} [opts]
+ * @param {number} [opts.pixels] — Scroll by N pixels instead of one viewport
+ * @returns {Promise<void>}
+ */
+async function scrollUp(page, opts = {}) {
+  const px = opts.pixels || 0;
+  await page.evaluate((p) => {
+    window.scrollBy(0, -(p || window.innerHeight));
+  }, px);
+  await page.waitForTimeout(300);
+}
+
+/**
+ * Attempt to dismiss common overlays: cookie banners, consent popups,
+ * notification prompts. Clicks common "Accept" / "Close" buttons.
+ * Safe to call multiple times — no-op if no overlays are found.
+ *
+ * @param {import('playwright').Page} page
+ * @returns {Promise<{dismissed: number}>}
+ */
+async function dismissOverlays(page) {
+  let dismissed = 0;
+  const selectors = [
+    // Cookie consent buttons (common patterns)
+    'button:has-text("Accept all")',
+    'button:has-text("Accept")',
+    'button:has-text("Agree")',
+    'button:has-text("Got it")',
+    'button:has-text("OK")',
+    'button:has-text("Принять")',
+    'button:has-text("Согласен")',
+    'button:has-text("Понятно")',
+    // Close buttons on modals/popups
+    '[aria-label="Close"]',
+    '[aria-label="Dismiss"]',
+    '[aria-label="close"]',
+    // Common cookie banner IDs/classes
+    '#onetrust-accept-btn-handler',
+    '.cookie-consent-accept',
+    '.cc-accept',
+    '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+    '#accept-cookie-notification',
+  ];
+
+  for (const sel of selectors) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 500 })) {
+        await el.click({ timeout: 2000 });
+        dismissed++;
+        await page.waitForTimeout(300);
+      }
+    } catch (_) {
+      // Not found or not clickable — continue
+    }
+  }
+  return { dismissed };
 }
 
 // ─── TEXT EXTRACTION ────────────────────────────────────────────────────────
@@ -2376,13 +2821,20 @@ module.exports = {
   solveCaptcha,
 
   // Screenshots
-  takeScreenshot, screenshotAndReport,
+  takeScreenshot, screenshotAndReport, takeScreenshotWithLabels,
 
   // Observation layer (accessibility tree)
   snapshot, snapshotAI, dumpInteractiveElements,
+  compactSnapshot, limitDepth,
 
   // Ref-based interactions (use with snapshotAI)
-  clickRef, fillRef, typeRef, selectRef, hoverRef,
+  refLocator, clickRef, fillRef, typeRef, selectRef, hoverRef,
+
+  // Scroll helpers
+  scrollDown, scrollUp,
+
+  // Dismiss overlays (cookie banners, consent popups)
+  dismissOverlays,
 
   // Text extraction (readability)
   extractText,
@@ -2398,6 +2850,9 @@ module.exports = {
 
   // Rich text editors
   pasteIntoEditor,
+
+  // Page state tracking
+  ensurePageState, getConsoleMessages, getPageErrors, getNetworkRequests,
 
   // Internals (exposed for advanced users / daemon)
   makeProxy, buildDevice, resolveAgentCredentials,

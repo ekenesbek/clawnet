@@ -374,6 +374,35 @@ function isSelectorAction(action) {
   return SELECTOR_ACTIONS.has(String(action || '').trim());
 }
 
+/**
+ * Compute a human-readable diff between two accessibility tree snapshots.
+ * Returns a compact description of what changed on the page.
+ *
+ * @param {string} before — YAML accessibility tree before the action
+ * @param {string} after  — YAML accessibility tree after the action
+ * @returns {string} Human-readable diff
+ */
+function computeSnapshotDiff(before, after) {
+  if (!before && !after) return 'No page content.';
+  if (before === after) return 'No changes detected.';
+  if (!before) return 'Page loaded:\n' + after;
+
+  const beforeLines = before.split('\n').map(l => l.trim()).filter(Boolean);
+  const afterLines  = after.split('\n').map(l => l.trim()).filter(Boolean);
+
+  const beforeSet = new Set(beforeLines);
+  const afterSet  = new Set(afterLines);
+
+  const added   = afterLines.filter(l => !beforeSet.has(l));
+  const removed = beforeLines.filter(l => !afterSet.has(l));
+
+  const parts = [];
+  if (added.length > 0)   parts.push('Added:\n' + added.map(l => '  + ' + l).join('\n'));
+  if (removed.length > 0) parts.push('Removed:\n' + removed.map(l => '  - ' + l).join('\n'));
+  if (parts.length === 0) return 'No changes detected.';
+  return parts.join('\n');
+}
+
 // Active browser instances keyed by profile name (for reuse mode)
 // Value: { browser, ctx, proxyEnabled, activePage }
 const _activeBrowsers = new Map();
@@ -1733,7 +1762,7 @@ function buildResult(browser, ctx, page, logger, opts = {}) {
     });
   }
 
-  // ── Wrap human* functions ──
+  // ── Wrap functions with logging only (no page state change expected) ──
   const wrap = (name, fn) => {
     if (logger.level === 'off') return fn;
     return async (...args) => {
@@ -1785,16 +1814,59 @@ function buildResult(browser, ctx, page, logger, opts = {}) {
     return result;
   };
 
+  // ── Wrap actions with automatic observe-act-observe loop ──
+  // Actions that change page state (click, type, scroll, captcha) automatically:
+  //   1. Snapshot the page before the action
+  //   2. Execute the action
+  //   3. Wait for page to settle
+  //   4. Snapshot again + take screenshot
+  //   5. Return { result, diff, screenshot } so the agent sees what changed
+  const observeWrap = (name, fn) => {
+    return async (...args) => {
+      // Before: capture page state
+      let before;
+      try { before = await snapshot(rawPage, { interactiveOnly: true, timeout: 3000 }); } catch (_) { before = ''; }
+
+      const url = _safeUrl(rawPage);
+      let actionResult;
+      try {
+        actionResult = await fn(...args);
+        if (logger.level !== 'off') logger.log(name, { args: _sanitizeArgs(name, args), url, ok: true });
+      } catch (err) {
+        if (logger.level !== 'off') logger.log(name, { args: _sanitizeArgs(name, args), url, error: err.message });
+        throw err;
+      }
+
+      // After: wait for page to settle, then observe
+      await sleep(rand(300, 700));
+
+      let after, screenshotBase64;
+      try { after = await snapshot(rawPage, { interactiveOnly: true, timeout: 3000 }); } catch (_) { after = ''; }
+      try { screenshotBase64 = await takeScreenshot(rawPage); } catch (_) { screenshotBase64 = null; }
+
+      const diff = computeSnapshotDiff(before, after);
+      if (logger.level !== 'off') logger.log(name + '_observed', { diff: _truncate(diff, 1000), url: _safeUrl(rawPage) });
+
+      return { result: actionResult, diff, screenshot: screenshotBase64 };
+    };
+  };
+
   return {
     browser, ctx,
     page: proxiedPage,
     logger,
-    humanClick:     wrap('humanClick', humanClick),
+
+    // Actions with automatic observation (observe → act → observe)
+    humanClick:     observeWrap('humanClick', humanClick),
+    humanType:      observeWrap('humanType', humanType),
+    humanScroll:    observeWrap('humanScroll', humanScroll),
+    solveCaptcha:   observeWrap('solveCaptcha', (captchaOpts) => solveCaptcha(rawPage, captchaOpts)),
+
+    // Actions without observation (no page state change expected)
     humanMouseMove: wrap('humanMouseMove', humanMouseMove),
-    humanType:      wrap('humanType', humanType),
-    humanScroll:    wrap('humanScroll', humanScroll),
     humanRead:      wrap('humanRead', humanRead),
-    solveCaptcha:   wrap('solveCaptcha', (captchaOpts) => solveCaptcha(rawPage, captchaOpts)),
+
+    // Screenshots
     takeScreenshot: wrappedScreenshot,
     screenshotAndReport: wrappedScreenshotAndReport,
     takeScreenshotWithLabels: async (refs, opts) => {
@@ -1860,7 +1932,7 @@ function buildResult(browser, ctx, page, logger, opts = {}) {
  * @param {string}  opts.logLevel  — 'off' | 'actions' | 'verbose'. Default: 'actions' (env CN_LOG_LEVEL)
  * @param {string}  opts.task      — User's task / prompt to record in the session log. Optional.
  *
- * @returns {{ browser, ctx, page, logger, humanClick, humanMouseMove, humanType, humanScroll, humanRead, solveCaptcha, takeScreenshot, screenshotAndReport, snapshot, dumpInteractiveElements, sleep, rand, getSessionLog }}
+ * @returns {{ browser, ctx, page, logger, humanClick, humanMouseMove, humanType, humanScroll, humanRead, solveCaptcha, takeScreenshot, screenshotAndReport, snapshot, dumpInteractiveElements, extractText, getCookies, setCookies, clearCookies, batchActions, sleep, rand, getSessionLog }}
  */
 async function launchBrowser(opts = {}) {
   const {
@@ -2987,6 +3059,7 @@ module.exports = {
 
   // Dismiss overlays (cookie banners, consent popups)
   dismissOverlays,
+  computeSnapshotDiff,
 
   // Text extraction (readability)
   extractText,

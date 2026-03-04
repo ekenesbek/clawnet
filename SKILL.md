@@ -66,6 +66,100 @@ The agent works in a **snapshot → act → re-snapshot** loop. Navigate only wh
 - **Navigate ONLY when going to a NEW URL.** If you are already on the page, DO NOT call `page.goto()` again — it reloads the page and destroys filled forms, scroll position, and dynamic state.
 - **After EVERY action (click, fill, type), re-snapshot** to see updated refs. Old refs become invalid after the DOM changes.
 - **Never use refs from a previous snapshot** after navigating or clicking a link that changes the page.
+### Observe → Act → Observe loop
+
+Every action (`humanClick`, `humanType`, `humanScroll`, `solveCaptcha`) **automatically observes** the page before and after execution. You get back a diff of what changed plus a screenshot:
+
+```javascript
+const { page, snapshot, humanClick, humanType } = await launchBrowser();
+await page.goto('https://restaurant.com/booking');
+
+// First, observe the page to understand what's there
+const tree = await snapshot({ interactiveOnly: true });
+// tree shows: textbox "Date", textbox "Guests", button "Find Tables"
+
+// Every action returns { result, diff, screenshot }
+const { diff, screenshot } = await humanType(page, '#date', '2026-03-08');
+// diff = "Added:\n  + listbox 'Suggestions'\n  + option 'March 8, Saturday'"
+// screenshot = base64 PNG of current page state
+
+const { diff: diff2 } = await humanClick(page, 200, 300);
+// diff2 = "Added:\n  + dialog 'Available Tables'\n  + button 'Book 19:00'\n  + button 'Book 20:00'\nRemoved:\n  + button 'Find Tables'"
+// Agent now knows: a dialog appeared with 2 booking options!
+```
+
+**Always check the `diff`** after each action. It tells you:
+- Whether your action worked (did the form value change?)
+- What new elements appeared (dialogs, error messages, dropdowns)
+- What disappeared (loading spinners, old content)
+- Whether to retry or try a different approach
+
+### Feeding screenshots back to the LLM
+
+Actions return a `screenshot` (base64 PNG) — but as a string it's useless unless you feed it back as a **visual image**. Return it as a multimodal content block so the LLM actually sees the page in the next turn:
+
+```javascript
+// In your tool function, return content blocks instead of plain text:
+const { diff, screenshot } = await humanClick(page, 200, 300);
+
+// Build multimodal result — the LLM will SEE the screenshot
+const content = [
+  { type: "text", text: `Clicked button. Changes:\n${diff}` }
+];
+if (screenshot) {
+  content.push({ type: "image", data: screenshot, mimeType: "image/png" });
+}
+return { content };
+```
+
+**This is critical for navigation.** Without feeding the screenshot back, the LLM is blind — it only has the text diff. With the screenshot, the LLM can see:
+- Whether the page loaded correctly
+- Visual layout, colors, images, maps
+- Error states that aren't in the accessibility tree (red borders, toast notifications)
+- CAPTCHAs and other visual challenges
+
+#### When to include screenshots in results
+
+**Always** include the screenshot from observed actions (`humanClick`, `humanType`, `humanScroll`, `solveCaptcha`) in your tool result. These actions already capture screenshots automatically — just pass them through:
+
+```javascript
+// Pattern: every observed action → multimodal result
+async function doStep(description, actionFn) {
+  const { diff, screenshot } = await actionFn();
+  const content = [{ type: "text", text: `${description}\n\nChanges:\n${diff}` }];
+  if (screenshot) content.push({ type: "image", data: screenshot, mimeType: "image/png" });
+  return { content };
+}
+
+// Usage
+return await doStep("Filled email field", () => humanType(page, '#email', 'user@example.com'));
+return await doStep("Clicked Sign In", () => humanClick(page, 400, 350));
+```
+
+For manual observations (after `page.goto`, after raw Playwright calls), take and include a screenshot explicitly:
+
+```javascript
+await page.goto('https://example.com');
+const tree = await snapshot({ interactiveOnly: true });
+const screenshot = await takeScreenshot();
+
+return {
+  content: [
+    { type: "text", text: `Page loaded. Interactive elements:\n${tree}` },
+    { type: "image", data: screenshot, mimeType: "image/png" }
+  ]
+};
+```
+
+### Initial page observation
+
+Before your first action on a page, do a manual observation:
+
+1. **Quick scan** — `await snapshot({ interactiveOnly: true })` to see what you can interact with
+2. **Read content** — `await snapshot({ selector: 'main' })` if you need to understand page structure
+3. **Read text** — `await extractText()` if you need clean readable text (menus, prices, articles)
+4. **Visual check** — `await takeScreenshot()` only if you need to see colors, layout, maps, or images
+5. **Act** — use semantic locators (see below), or `batchActions()` for multi-step flows. Actions auto-observe for you.
 
 #### When to navigate vs when to just snapshot
 
@@ -344,26 +438,33 @@ const pricesSS = await resto.takeScreenshot();
 4. **After every key step** — filled form, selected date, entered address, etc.
 5. **When completing the task (MANDATORY)** — "Done! Order placed" + screenshot of the final result/confirmation page. The user must see proof that the action was completed.
 
-### How to take screenshots
+### How to take and return screenshots
 
-Use the built-in helpers returned by `launchBrowser()`:
+Use the built-in helpers returned by `launchBrowser()` and **always return screenshots as multimodal content blocks** so the LLM can see them:
 
 ```javascript
 const { page, takeScreenshot, screenshotAndReport } = await launchBrowser();
 
-// Option 1: just the base64 screenshot
+// Option 1: take screenshot + return as content block
 const base64 = await takeScreenshot();
+return {
+  content: [
+    { type: "text", text: "Form filled. Confirm booking?" },
+    { type: "image", data: base64, mimeType: "image/png" }
+  ]
+};
 
-// Option 2: screenshot + message bundled together
+// Option 2: use screenshotAndReport helper
 const report = await screenshotAndReport("Form filled. Confirm booking?");
-// → { message: "Form filled...", screenshot: "iVBOR...", mimeType: "image/png" }
+return {
+  content: [
+    { type: "text", text: report.message },
+    { type: "image", data: report.screenshot, mimeType: report.mimeType }
+  ]
+};
 ```
 
-Or directly via Playwright:
-```javascript
-const screenshot = await page.screenshot({ type: 'png' });
-const base64 = screenshot.toString('base64');
-```
+**Important:** A base64 string in a variable is useless — the LLM can only see images when they're returned as `{ type: "image" }` content blocks in the tool result.
 
 ### Rules
 
@@ -689,13 +790,24 @@ Returns: `string` (base64 PNG)
 
 ### `screenshotAndReport(page, message, opts)`
 
-Take a screenshot and pair it with a message. Returns an object ready to attach to an LLM response.
+Take a screenshot and pair it with a message. Returns an object that can be converted to multimodal content blocks.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `fullPage` | boolean | `false` | Capture the full scrollable page |
 
 Returns: `{ message, screenshot, mimeType }` — screenshot is base64 PNG
+
+Convert to content blocks for the LLM:
+```javascript
+const report = await screenshotAndReport("Booking confirmed!");
+return {
+  content: [
+    { type: "text", text: report.message },
+    { type: "image", data: report.screenshot, mimeType: report.mimeType }
+  ]
+};
+```
 
 ### `snapshot(page, opts)` / `snapshot(opts)` (from launchBrowser return)
 
@@ -1011,13 +1123,19 @@ const result = await batchActions([
 
 Type text with human-like speed (60-220ms/char) and occasional micro-pauses.
 
+Returns: `{ result, diff, screenshot }` — diff shows what changed on the page, screenshot is base64 PNG.
+
 ### `humanClick(page, x, y)`
 
 Click with natural Bezier curve mouse movement.
 
+Returns: `{ result, diff, screenshot }` — diff shows what changed on the page, screenshot is base64 PNG.
+
 ### `humanScroll(page, direction, amount)`
 
 Smooth multi-step scroll with jitter. Direction: `'down'` or `'up'`.
+
+Returns: `{ result, diff, screenshot }` — diff shows what changed (e.g., new content from lazy loading).
 
 ### `humanRead(page, minMs, maxMs)`
 
@@ -1164,7 +1282,7 @@ Build proxy config from environment variables. Supports Decodo, Bright Data, IPR
 
 ```javascript
 const { launchBrowser } = require('clawnet/scripts/browser');
-const { page, snapshot } = await launchBrowser({ country: 'us', mobile: false });
+const { page, snapshot, humanType, humanClick, takeScreenshot } = await launchBrowser({ country: 'us', mobile: false });
 
 await page.goto('https://github.com/login');
 
@@ -1172,29 +1290,56 @@ await page.goto('https://github.com/login');
 const tree = await snapshot({ interactiveOnly: true });
 // tree shows: textbox "Username or email address", textbox "Password", button "Sign in"
 
+// Every action auto-observes — check diff to verify it worked
+const { diff: d1 } = await humanType(page, '#login_field', 'myuser');
+// d1 tells you if the field accepted input
+
+const { diff: d2 } = await humanType(page, '#password', 'mypass');
+
 // Use semantic locators that match the snapshot
-await page.getByLabel('Username or email address').fill('myuser');
-await page.getByLabel('Password').fill('mypass');
+// Note: only humanClick/humanType/humanScroll/solveCaptcha auto-observe.
+// For raw Playwright clicks, call snapshot() + takeScreenshot() manually after:
 await page.getByRole('button', { name: 'Sign in' }).click();
+const afterLogin = await snapshot();
+const screenshot = await takeScreenshot();
+
+// Feed the result back to the LLM as a multimodal content block
+// so it can SEE the page after login:
+return {
+  content: [
+    { type: "text", text: `Login submitted. Page state:\n${afterLogin}` },
+    { type: "image", data: screenshot, mimeType: "image/png" }
+  ]
+};
 ```
 
 ### Scrape with CAPTCHA bypass
 
 ```javascript
-const { launchBrowser, solveCaptcha } = require('clawnet/scripts/browser');
-const { page, snapshot } = await launchBrowser({ country: 'de' });
+const { launchBrowser } = require('clawnet/scripts/browser');
+const { page, snapshot, solveCaptcha, takeScreenshot } = await launchBrowser({ country: 'de' });
 
 await page.goto('https://protected-site.com');
 
 // Auto-detect and solve any CAPTCHA
 try {
-  await solveCaptcha(page, { verbose: true });
+  const { diff } = await solveCaptcha({ verbose: true });
+  // diff tells you if the CAPTCHA was solved and what appeared after
 } catch (e) {
   console.log('No CAPTCHA found or solving failed:', e.message);
 }
 
 // Read the content area compactly
 const content = await snapshot({ selector: '.content' });
+const screenshot = await takeScreenshot();
+
+// Return with visual proof so the LLM sees the actual page
+return {
+  content: [
+    { type: "text", text: `Scraped content:\n${content}` },
+    { type: "image", data: screenshot, mimeType: "image/png" }
+  ]
+};
 ```
 
 ### Fill Shadow DOM forms

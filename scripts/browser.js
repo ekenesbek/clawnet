@@ -1251,7 +1251,60 @@ async function _connectDaemon() {
  * All actions are scoped to that tab automatically.
  */
 function buildDaemonResult(daemonPort, logger, tabId = null) {
-  const post = (endpoint, body) => _daemonPost(daemonPort, endpoint, body);
+  const _sanitizeDaemonPayload = (payload) => {
+    if (!payload || typeof payload !== 'object') return payload;
+    try {
+      const copy = JSON.parse(JSON.stringify(payload));
+      if (typeof copy.base64 === 'string' && copy.base64.length > 120) {
+        copy.base64 = `<base64:${copy.base64.length} chars>`;
+      }
+      if (typeof copy.screenshot === 'string' && copy.screenshot.length > 120) {
+        copy.screenshot = `<base64:${copy.screenshot.length} chars>`;
+      }
+      if (Array.isArray(copy.actions)) {
+        copy.actions = copy.actions.map((a) => {
+          const next = { ...a };
+          if (typeof next.text === 'string' && next.text.length > 120) next.text = next.text.slice(0, 120) + '…';
+          if (typeof next.value === 'string' && next.value.length > 120) next.value = next.value.slice(0, 120) + '…';
+          return next;
+        });
+      }
+      return copy;
+    } catch (_) {
+      return '[unserializable]';
+    }
+  };
+  const post = (endpoint, body) => {
+    const startedAt = Date.now();
+    const safeBody = _sanitizeDaemonPayload(body);
+    if (logger.level !== 'off') {
+      logger.log('daemon_request', { endpoint, tabId: body?.tabId || tabId || null, body: safeBody });
+    }
+    return _daemonPost(daemonPort, endpoint, body)
+      .then((res) => {
+        if (logger.level !== 'off') {
+          logger.log('daemon_response', {
+            endpoint,
+            tabId: res?.tabId || body?.tabId || tabId || null,
+            ok: res?.ok === true,
+            ms: Date.now() - startedAt,
+            response: _sanitizeDaemonPayload(res),
+          });
+        }
+        return res;
+      })
+      .catch((err) => {
+        if (logger.level !== 'off') {
+          logger.log('daemon_error', {
+            endpoint,
+            tabId: body?.tabId || tabId || null,
+            ms: Date.now() - startedAt,
+            error: err?.message || String(err),
+          });
+        }
+        throw err;
+      });
+  };
   const selectorEnabled = areSelectorActionsEnabled();
   const rejectSelectorAction = () => {
     throw new Error(REF_ONLY_ACTION_MESSAGE);
